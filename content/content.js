@@ -170,41 +170,76 @@
   }
 
   /**
-   * Multi-level Click Dispatcher specifically for Meta Bloks buttons
-   * (e.g. Red "Unlike" or "Delete" action button and modal confirmation button).
-   * Handles elements with pointer-events: none wrappers.
+   * Resolves an element to the actual clickable/interactive DOM node in Meta Bloks.
+   * Handles cases where:
+   * 1. The candidate is an outer wrapper with pointer-events: none (drills down to inner button with pointer-events: auto).
+   * 2. The candidate is a leaf text span or icon (walks up to the nearest interactive button).
+   * 3. The candidate is already the interactive button.
    */
-  function clickBloksButton(el) {
-    if (!el) return false;
+  function resolveInteractiveButton(el) {
+    if (!el) return null;
 
-    try {
-      el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    } catch (e) {}
+    // 1. If el contains a child button that has pointer-events !== 'none'
+    // or cursor: pointer, drill down to the innermost interactive button!
+    const innerCandidates = Array.from(el.querySelectorAll('button, [role="button"], [style*="cursor: pointer"], [style*="pointer-events: auto"]'));
+    for (const inner of innerCandidates) {
+      if (inner.closest('#insta-clean-root')) continue;
+      const comp = window.getComputedStyle(inner);
+      const inlineStyle = inner.getAttribute('style') || '';
+      const isInteractive = comp.pointerEvents !== 'none' || inlineStyle.includes('pointer-events: auto');
+      const hasPointer = comp.cursor === 'pointer' || inlineStyle.includes('cursor: pointer');
+      const isButton = inner.getAttribute('role') === 'button' || inner.tagName === 'BUTTON';
 
-    // Find the interactive ancestor (role="button", button, or ancestor with pointer-events !== none)
-    let interactiveAncestor = null;
+      // Prefer the innermost leaf button node
+      if (isInteractive && (hasPointer || isButton)) {
+        const deeperButton = inner.querySelector('button, [role="button"]');
+        if (!deeperButton) {
+          return inner;
+        }
+      }
+    }
+
+    // 2. If el itself is interactive with role="button" or button, check if it has child buttons
+    const elComp = window.getComputedStyle(el);
+    const elStyle = el.getAttribute('style') || '';
+    const elIsButton = el.getAttribute('role') === 'button' || el.tagName === 'BUTTON';
+    const elIsInteractive = elComp.pointerEvents !== 'none' && !elStyle.includes('pointer-events: none');
+
+    if (elIsButton && elIsInteractive && !el.querySelector('button, [role="button"]')) {
+      return el;
+    }
+
+    // 3. If el is a child (e.g. span, div, text node parent), walk up to find the closest interactive button
     let curr = el;
     while (curr && curr !== document.body) {
+      if (curr.closest && curr.closest('#insta-clean-root')) break;
       if (curr.getAttribute('role') === 'button' || curr.tagName === 'BUTTON') {
-        interactiveAncestor = curr;
-        break;
+        const cComp = window.getComputedStyle(curr);
+        const cStyle = curr.getAttribute('style') || '';
+        if (cComp.pointerEvents !== 'none' || cStyle.includes('pointer-events: auto') || cComp.cursor === 'pointer' || cStyle.includes('cursor: pointer')) {
+          return curr;
+        }
       }
       curr = curr.parentElement;
     }
 
-    if (!interactiveAncestor) {
-      curr = el.parentElement;
-      for (let i = 0; i < 5 && curr && curr !== document.body; i++) {
-        const style = window.getComputedStyle(curr);
-        if (style.pointerEvents !== 'none') {
-          interactiveAncestor = curr;
-          break;
-        }
-        curr = curr.parentElement;
-      }
-    }
+    // 4. Fallback: closest button or el
+    return el.closest('button, [role="button"]') || el;
+  }
 
-    const clickTarget = interactiveAncestor || el;
+  /**
+   * Multi-level Click Dispatcher specifically for Meta Bloks buttons
+   * (e.g. Red "Unlike" or "Delete" action button and modal confirmation button).
+   * Resolves to the true interactive element and dispatches full synthetic mouse/pointer/keyboard events.
+   */
+  function clickBloksButton(el) {
+    if (!el) return false;
+
+    const clickTarget = resolveInteractiveButton(el) || el;
+
+    try {
+      clickTarget.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    } catch (e) {}
 
     const rect = clickTarget.getBoundingClientRect();
     const x = Math.round(rect.left + rect.width / 2);
@@ -215,10 +250,11 @@
       cancelable: true,
       composed: true,
       view: window,
+      detail: 1,
       clientX: x,
       clientY: y,
-      screenX: window.screenX + x,
-      screenY: window.screenY + y,
+      screenX: (window.screenX || 0) + x,
+      screenY: (window.screenY || 0) + y,
       button: 0,
       buttons: 1,
       pointerId: 1,
@@ -226,47 +262,74 @@
       isPrimary: true
     };
 
-    // Temporarily bypass pointer-events: none on any intermediate wrapper
+    // Temporarily bypass pointer-events: none on any intermediate wrapper or ancestor
     const resetStyles = [];
-    let p = el;
+    let p = clickTarget;
     while (p && p !== document.body) {
-      if (window.getComputedStyle(p).pointerEvents === 'none') {
+      if (p.style && p.style.pointerEvents === 'none') {
         resetStyles.push({ el: p, prev: p.style.pointerEvents });
         p.style.pointerEvents = 'auto';
       }
       p = p.parentElement;
     }
 
+    // Also ensure descendants within clickTarget don't block hit testing
+    clickTarget.querySelectorAll('*').forEach(child => {
+      if (child.style && child.style.pointerEvents === 'none') {
+        resetStyles.push({ el: child, prev: child.style.pointerEvents });
+        child.style.pointerEvents = 'auto';
+      }
+    });
+
     try {
+      // Find innermost target directly under the click coordinates
+      const hitEl = document.elementFromPoint(x, y);
+      const innerTarget = (hitEl && clickTarget.contains(hitEl)) ? hitEl : (clickTarget.querySelector('span, [dir="auto"]') || clickTarget);
+
       // 1. Focus
       try { clickTarget.focus?.(); } catch (e) {}
-      try { el.focus?.(); } catch (e) {}
+      try { innerTarget.focus?.(); } catch (e) {}
 
-      // 2. Pointer & mouse down
-      try { clickTarget.dispatchEvent(new PointerEvent('pointerover', eventProps)); } catch (e) {}
-      try { clickTarget.dispatchEvent(new PointerEvent('pointerenter', eventProps)); } catch (e) {}
-      try { clickTarget.dispatchEvent(new PointerEvent('pointerdown', eventProps)); } catch (e) {}
-      try { clickTarget.dispatchEvent(new MouseEvent('mouseover', eventProps)); } catch (e) {}
-      try { clickTarget.dispatchEvent(new MouseEvent('mousedown', eventProps)); } catch (e) {}
+      // 2. Pointer & mouse down on innerTarget (bubbles up through clickTarget)
+      try { innerTarget.dispatchEvent(new PointerEvent('pointerover', eventProps)); } catch (e) {}
+      try { innerTarget.dispatchEvent(new PointerEvent('pointerenter', { ...eventProps, bubbles: false })); } catch (e) {}
+      try { innerTarget.dispatchEvent(new PointerEvent('pointerdown', eventProps)); } catch (e) {}
+      try { innerTarget.dispatchEvent(new MouseEvent('mouseover', eventProps)); } catch (e) {}
+      try { innerTarget.dispatchEvent(new MouseEvent('mousedown', eventProps)); } catch (e) {}
 
       // 3. Pointer & mouse up
-      eventProps.buttons = 0;
-      try { clickTarget.dispatchEvent(new PointerEvent('pointerup', eventProps)); } catch (e) {}
-      try { clickTarget.dispatchEvent(new MouseEvent('mouseup', eventProps)); } catch (e) {}
+      const upProps = { ...eventProps, buttons: 0 };
+      try { innerTarget.dispatchEvent(new PointerEvent('pointerup', upProps)); } catch (e) {}
+      try { innerTarget.dispatchEvent(new MouseEvent('mouseup', upProps)); } catch (e) {}
 
-      // 4. Click event on target
-      try { clickTarget.dispatchEvent(new MouseEvent('click', eventProps)); } catch (e) {}
-      try { clickTarget.click(); } catch (e) {}
+      // 4. Click event on innerTarget
+      try { innerTarget.dispatchEvent(new MouseEvent('click', upProps)); } catch (e) {}
 
-      // 5. Also dispatch click directly on el if different
-      if (el !== clickTarget) {
-        try { el.dispatchEvent(new MouseEvent('click', eventProps)); } catch (e) {}
-        try { el.click(); } catch (e) {}
+      // 5. If innerTarget is not clickTarget, also dispatch directly on clickTarget
+      if (innerTarget !== clickTarget) {
+        try { clickTarget.dispatchEvent(new PointerEvent('pointerdown', eventProps)); } catch (e) {}
+        try { clickTarget.dispatchEvent(new MouseEvent('mousedown', eventProps)); } catch (e) {}
+        try { clickTarget.dispatchEvent(new PointerEvent('pointerup', upProps)); } catch (e) {}
+        try { clickTarget.dispatchEvent(new MouseEvent('mouseup', upProps)); } catch (e) {}
+        try { clickTarget.dispatchEvent(new MouseEvent('click', upProps)); } catch (e) {}
       }
+
+      // 6. Native .click() calls
+      try { innerTarget.click?.(); } catch (e) {}
+      try { clickTarget.click?.(); } catch (e) {}
+
+      // 7. Keyboard Enter/Space activation (supported by Bloks role="button" elements)
+      const enterDown = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+      const enterUp = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+      try { clickTarget.dispatchEvent(enterDown); } catch (e) {}
+      try { clickTarget.dispatchEvent(enterUp); } catch (e) {}
     } finally {
-      resetStyles.forEach(({ el: rEl, prev }) => {
-        rEl.style.pointerEvents = prev;
-      });
+      // Revert overridden styles after a short delay so asynchronous handlers can finish
+      setTimeout(() => {
+        resetStyles.forEach(({ el: rEl, prev }) => {
+          try { rEl.style.pointerEvents = prev; } catch (e) {}
+        });
+      }, 350);
     }
 
     return true;
@@ -278,7 +341,7 @@
 
   function isInSelectMode() {
     const cancelBtn = findCancelButton();
-    if (cancelBtn) return true;
+    if (cancelBtn && cancelBtn.getBoundingClientRect().top < 400) return true;
 
     const count = getSelectedCountFromUI();
     if (count !== null && count > 0) return true;
@@ -292,11 +355,15 @@
   function findSelectButton() {
     const candidates = Array.from(document.querySelectorAll('button, div[role="button"], span, a, div'));
     for (const el of candidates) {
+      if (el.closest('#insta-clean-root')) continue;
       const text = (el.textContent || '').trim();
-      if (/^select$/i.test(text)) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && rect.top < 400) {
-          return el.closest('[role="button"]') || el.closest('button') || el;
+      const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+      if (/^select$/i.test(text) || /^select$/i.test(ariaLabel)) {
+        const clickable = resolveInteractiveButton(el);
+        if (!clickable) continue;
+        const rect = clickable.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 && rect.top < 400 && !isInsideDialog(clickable)) {
+          return clickable;
         }
       }
     }
@@ -306,11 +373,17 @@
   function findCancelButton() {
     const candidates = Array.from(document.querySelectorAll('button, div[role="button"], span, a, div'));
     for (const el of candidates) {
+      if (el.closest('#insta-clean-root')) continue;
       const text = (el.textContent || '').trim();
-      if (/^cancel$/i.test(text)) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0 && rect.top < 400 && !isInsideDialog(el)) {
-          return el;
+      const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+      if (/^(cancel|close)$/i.test(text) || /^(cancel|close)$/i.test(ariaLabel)) {
+        const clickable = resolveInteractiveButton(el);
+        if (!clickable) continue;
+        const rect = clickable.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 && !isInsideDialog(clickable)) {
+          if (rect.top < 400 || rect.bottom > window.innerHeight * 0.7) {
+            return clickable;
+          }
         }
       }
     }
@@ -321,6 +394,7 @@
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while (node = walker.nextNode()) {
+      if (node.parentElement?.closest('#insta-clean-root')) continue;
       const val = (node.nodeValue || '').trim();
       const match = val.match(/^(\d+)\s+selected$/i) || val.match(/(\d+)\s+selected/i);
       if (match) {
@@ -400,14 +474,17 @@
   }
 
   function isInsideDialog(el) {
-    if (!el) return false;
+    if (!el || el.closest('#insta-clean-root')) return false;
     let curr = el.parentElement;
     while (curr && curr !== document.body) {
       if (curr.getAttribute('role') === 'dialog' || curr.getAttribute('aria-modal') === 'true') {
         return true;
       }
-      const text = curr.textContent || '';
-      if (/unlike posts\?/i.test(text) || /delete this repost\?/i.test(text) || /delete these reposts\?/i.test(text) || /are you sure/i.test(text)) {
+      const text = (curr.textContent || '').toLowerCase();
+      if (
+        (text.includes('unlike') || text.includes('delete')) &&
+        (text.includes('unlike posts?') || text.includes('delete this repost?') || text.includes('are you sure') || text.includes('unlike?'))
+      ) {
         return true;
       }
       curr = curr.parentElement;
@@ -421,32 +498,74 @@
    * Both use Meta Bloks rgb(254, 67, 88).
    */
   function findRedActionButton(requireInDialog = false) {
-    const candidates = Array.from(document.querySelectorAll('button, [role="button"], span, div.wbloks_1, div'));
-    for (const el of candidates) {
+    const mode = getPageMode();
+    const actionVerb = mode === 'reposts' ? 'delete' : 'unlike';
+    const actionRegex = new RegExp(`^(${actionVerb}|unlike|delete)(\\s*(\\(\\d+\\)|\\d+))?(\\s+(posts?|reposts?))?$`, 'i');
+
+    const candidates = [];
+
+    // Query all elements that could be or contain the action button
+    const elements = Array.from(document.querySelectorAll(
+      `button, [role="button"], span, div.wbloks_1, div, [aria-label*="${actionVerb}" i], [aria-label*="Unlike" i], [aria-label*="Delete" i]`
+    ));
+
+    for (const el of elements) {
+      if (el.closest('#insta-clean-root')) continue;
+
+      const inDialog = isInsideDialog(el);
+      if (inDialog !== requireInDialog) continue;
+
       const text = (el.textContent || '').trim();
-      if (/^(unlike|delete)(\s*\(\d+\))?$/i.test(text)) {
-        const inDialog = isInsideDialog(el);
-        if (inDialog !== requireInDialog) continue;
+      const ariaLabel = (el.getAttribute('aria-label') || '').trim();
 
-        const comp = window.getComputedStyle(el);
-        const inlineStyle = el.getAttribute('style') || '';
-        const color = comp.color || '';
+      const textMatch = actionRegex.test(text);
+      const ariaMatch = actionRegex.test(ariaLabel);
 
-        const isTargetRed = color.includes('254, 67, 88') ||
-                            inlineStyle.includes('254, 67, 88') ||
-                            color.includes('237, 73, 86') ||
-                            color.includes('255, 48, 64') ||
-                            color.includes('234, 67, 53');
+      if (!textMatch && !ariaMatch) continue;
 
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          if (isTargetRed || requireInDialog || rect.bottom > window.innerHeight * 0.3) {
-            return el;
-          }
-        }
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+
+      // When not in dialog, button must be in bottom action area
+      if (!requireInDialog && rect.bottom <= window.innerHeight * 0.3) {
+        continue;
       }
+
+      const comp = window.getComputedStyle(el);
+      const inlineStyle = el.getAttribute('style') || '';
+      const color = comp.color || '';
+
+      const isTargetRed = color.includes('254, 67, 88') ||
+                          inlineStyle.includes('254, 67, 88') ||
+                          color.includes('237, 73, 86') ||
+                          color.includes('255, 48, 64') ||
+                          color.includes('234, 67, 53');
+
+      const isPointerAuto = comp.pointerEvents !== 'none' && !inlineStyle.includes('pointer-events: none');
+      const isCursorPointer = comp.cursor === 'pointer' || inlineStyle.includes('cursor: pointer');
+      const isButtonRole = el.getAttribute('role') === 'button' || el.tagName === 'BUTTON';
+      const hasChildButton = el.querySelector('[role="button"], button') !== null;
+
+      let score = 0;
+      if (isButtonRole) score += 30;
+      if (isPointerAuto) score += 40;
+      else score -= 80; // Penalize pointer-events: none container
+
+      if (isCursorPointer) score += 30;
+      if (isTargetRed) score += 40;
+      if (ariaMatch) score += 25;
+      if (!hasChildButton) score += 35; // Prefer leaf button
+      else score -= 40; // Penalize container wrapping another button
+
+      candidates.push({ el, score });
     }
-    return null;
+
+    if (candidates.length === 0) return null;
+
+    candidates.sort((a, b) => b.score - a.score);
+
+    const best = candidates[0].el;
+    return resolveInteractiveButton(best) || best;
   }
 
   /**
@@ -454,17 +573,67 @@
    */
   function findDialogConfirmButton(dialog) {
     if (!dialog) return null;
+    const mode = getPageMode();
+    const actionVerb = mode === 'reposts' ? 'delete' : 'unlike';
+    const actionRegex = new RegExp(`^(${actionVerb}|unlike|delete)(\\s+(posts?|reposts?))?$`, 'i');
+
     const candidates = Array.from(dialog.querySelectorAll('button, [role="button"], span, div.wbloks_1, div'));
+
+    // 1. Text or aria-label matching action verb
     for (const el of candidates) {
+      if (el.closest('#insta-clean-root')) continue;
       const text = (el.textContent || '').trim();
-      if (/^(unlike|delete)$/i.test(text)) {
-        const clickable = el.closest('button') || el.closest('[role="button"]') || el;
-        const rect = clickable.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          return clickable;
+      const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+      if (actionRegex.test(text) || actionRegex.test(ariaLabel)) {
+        const resolved = resolveInteractiveButton(el);
+        if (resolved && dialog.contains(resolved)) {
+          const rect = resolved.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            return resolved;
+          }
         }
       }
     }
+
+    // 2. Red text inside dialog
+    for (const el of candidates) {
+      if (el.closest('#insta-clean-root')) continue;
+      const comp = window.getComputedStyle(el);
+      const inlineStyle = el.getAttribute('style') || '';
+      const color = comp.color || '';
+      const isRed = color.includes('254, 67, 88') ||
+                    inlineStyle.includes('254, 67, 88') ||
+                    color.includes('237, 73, 86') ||
+                    color.includes('255, 48, 64') ||
+                    color.includes('234, 67, 53');
+      if (isRed) {
+        const resolved = resolveInteractiveButton(el);
+        if (resolved && dialog.contains(resolved)) {
+          const rect = resolved.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            return resolved;
+          }
+        }
+      }
+    }
+
+    // 3. Fallback: Any button in dialog that is not Cancel or Close
+    const allButtons = Array.from(dialog.querySelectorAll('button, [role="button"]'));
+    for (const btn of allButtons) {
+      if (btn.closest('#insta-clean-root')) continue;
+      const text = (btn.textContent || '').trim().toLowerCase();
+      const ariaLabel = (btn.getAttribute('aria-label') || '').trim().toLowerCase();
+      if (!text.includes('cancel') && !text.includes('close') && !ariaLabel.includes('cancel') && !ariaLabel.includes('close')) {
+        const resolved = resolveInteractiveButton(btn);
+        if (resolved && dialog.contains(resolved)) {
+          const rect = resolved.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            return resolved;
+          }
+        }
+      }
+    }
+
     return null;
   }
 
@@ -474,8 +643,12 @@
   function findConfirmationDialog() {
     const dialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[aria-modal="true"]'));
     for (const d of dialogs) {
-      const text = d.textContent || '';
-      if (/(unlike|delete).*(post|repost)/i.test(text) || /are you sure/i.test(text) || /(unlike|delete)\?/i.test(text)) {
+      if (d.closest('#insta-clean-root')) continue;
+      const text = (d.textContent || '').toLowerCase();
+      if (
+        (text.includes('unlike') || text.includes('delete')) &&
+        (text.includes('post') || text.includes('repost') || text.includes('?') || text.includes('sure') || text.includes('cancel'))
+      ) {
         return d;
       }
     }
@@ -483,13 +656,17 @@
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
+      if (node.parentElement?.closest('#insta-clean-root')) continue;
       const val = (node.nodeValue || '').trim();
       if (/(unlike|delete).*(post|repost)/i.test(val) || /are you sure/i.test(val) || /(unlike|delete)\?/i.test(val)) {
         let parent = node.parentElement;
         while (parent && parent !== document.body) {
+          if (parent.closest('#insta-clean-root')) break;
           const comp = window.getComputedStyle(parent);
           if (comp.position === 'fixed' || comp.position === 'absolute' || parent.getAttribute('role') === 'dialog') {
-            return parent;
+            if (parent.getAttribute('role') === 'dialog' || comp.position === 'fixed' || (comp.top && comp.top !== 'auto' && comp.top !== '0px')) {
+              return parent;
+            }
           }
           parent = parent.parentElement;
         }
@@ -675,6 +852,12 @@
 
         const actionBtn = findRedActionButton(false);
         if (!actionBtn) {
+          // Check if unliking happened directly
+          const currentCount = getSelectedCountFromUI();
+          if (currentCount === 0 && !findRedActionButton(false)) {
+            addLog('Selection completed directly without confirmation prompt');
+            break;
+          }
           addLog(`Waiting for "${actionVerbCapital}" button to appear...`);
           await sleep(600);
           continue;
@@ -699,29 +882,39 @@
           addLog('Confirmation dialog opened');
           break;
         } else {
+          const currentCount = getSelectedCountFromUI();
+          if (currentCount === 0 && !findRedActionButton(false)) {
+            addLog('Action completed directly without confirmation prompt');
+            break;
+          }
           addLog(`Dialog not yet visible, retrying click...`);
           await sleep(400);
         }
       }
 
       if (!dialog || !dialogConfirmBtn) {
-        throw new Error(`Confirmation dialog did not appear. Please click the red ${actionVerbCapital} button manually.`);
-      }
-
-      // Step 4: Confirm in Dialog
-      if (state.autoConfirmDialog) {
-        setStatus('Confirming dialog...', 'running');
-        addLog(`Clicking "${actionVerbCapital}" inside dialog...`);
-        await sleep(400);
-
-        clickBloksButton(dialogConfirmBtn);
-        addLog(`Confirmed: Clicked "${actionVerbCapital}" in dialog`);
-        setStatus('Processing...', 'running');
-
-        await sleep(2500);
+        const currentCount = getSelectedCountFromUI();
+        if (currentCount === 0 && !findRedActionButton(false)) {
+          addLog(`Confirmed: Items ${actionVerbPast} directly`);
+        } else {
+          throw new Error(`Confirmation dialog did not appear. Please click the red ${actionVerbCapital} button manually.`);
+        }
       } else {
-        addLog(`Auto-confirm off. Click "${actionVerbCapital}" in the dialog manually.`);
-        setStatus('Awaiting dialog confirmation', 'paused');
+        // Step 4: Confirm in Dialog
+        if (state.autoConfirmDialog) {
+          setStatus('Confirming dialog...', 'running');
+          addLog(`Clicking "${actionVerbCapital}" inside dialog...`);
+          await sleep(400);
+
+          clickBloksButton(dialogConfirmBtn);
+          addLog(`Confirmed: Clicked "${actionVerbCapital}" in dialog`);
+          setStatus('Processing...', 'running');
+
+          await sleep(2500);
+        } else {
+          addLog(`Auto-confirm off. Click "${actionVerbCapital}" in the dialog manually.`);
+          setStatus('Awaiting dialog confirmation', 'paused');
+        }
       }
 
       // Step 5: Success & Record Stats
